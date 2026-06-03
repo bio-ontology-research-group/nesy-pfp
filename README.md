@@ -104,3 +104,7 @@ WMC does **not** repair perception failure (domain-novel proteins); the EC layer
 ## License
 
 Code and documentation released under the MIT License (see `LICENSE`).
+
+## Manuscript
+
+The full manuscript source (LaTeX + bibliography) is in `paper/` and is maintained on Overleaf. It consolidates every experiment and proof documented here: the memorization critique, the training-free WMC layer and its competence boundary, the machine-checked approximation theory, the modular construction, and the full neuro-symbolic-framework comparison.

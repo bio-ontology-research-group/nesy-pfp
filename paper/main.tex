@@ -1,0 +1,358 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,booktabs,graphicx,xcolor,microtype}
+\usepackage[hidelinks]{hyperref}
+\usepackage[numbers,sort&compress]{natbib}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{definition}{Definition}
+\newcommand{\WMC}{\mathrm{WMC}}
+\newcommand{\tw}{\mathrm{tw}}
+\newcommand{\Fmax}{F_{\max}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\bC}[1]{\boldsymbol{#1}}
+
+\title{\bfseries Protein function predictors memorize; a machine-checked weighted-model-counting layer generalizes where they fail}
+\author{R.\ Hoehndorf \textit{et al.}}
+\date{Draft --- \today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent State-of-the-art predictors of protein function attain high aggregate accuracy, yet
+it is unclear whether they generalize or memorize. Using similarity- and domain-controlled
+evaluation against the canonical CAFA \emph{Naive} and \emph{BLAST} baselines, we show that
+leading predictors---CLEAN for enzyme commission (EC) numbers and the DeepGO family for the gene
+ontology (GO)---succeed by memorizing homology and curated domain features and \emph{collapse
+out-of-distribution}: CLEAN's exact-EC accuracy falls $0.86\!\to\!0.07$ with sequence identity
+to its training set, and InterPro-feature models drop to the frequency floor on domain-novel
+proteins. We then test whether compiling the \emph{symbolic structure} of the target space
+(ontology axioms for GO; metabolic producibility for EC) into a differentiable
+weighted-model-counting (WMC) layer \emph{on top of any base predictor} restores generalization.
+It does, in a precisely delimited regime: a \emph{training-free} ontology-WMC layer gives any
+base predictor zero-shot reach over unseen GO terms that \emph{matches a purpose-trained
+zero-shot extrapolator} (molecular-function macro-AUC $0.9125$ vs.\ $0.9118$, $p=0.83$) while
+every trivial baseline is at chance. Crucially, the layer repairs the \emph{compositional}
+failure regime (zero-shot terms) but not the \emph{perception} failure regime (domain-novel
+proteins), where the base retains no signal to compose. We characterize the WMC approximation in
+machine-checked Lean~4---it is belief propagation, exact on the tree fragment for all priors,
+with error confined to reconvergences---make it tractable at GO scale through a modular
+decomposition that renders $92$--$100\%$ of GO exactly computable, and position it against the
+neuro-symbolic spectrum: exact knowledge compilation (DeepProbLog) walls at ${\sim}400$ terms;
+top-$k$ provenance (Scallop) scales but drifts at reconvergences; amortized inference (A-NeSI)
+and joint diffusion (NeSyDM) collapse on coupled structure. Ours is the method that is
+simultaneously scalable and accuracy-guaranteed.
+\end{abstract}
+
+\section{Introduction}
+Neuro-symbolic (NeSy) learning couples a neural perception model with symbolic reasoning, almost
+universally under a \emph{conditional-independence assumption}: the perception model emits
+independent per-concept marginals, and the symbolic layer treats them as an independent product
+\citep{manhaeve2018deepproblog,xu2018semanticloss,ahmed2022spl}. This assumption is known to
+impede optimization, distort uncertainty, and admit \emph{reasoning shortcuts}
+\citep{vankrieken2024independence,marconato2023reasoningshortcuts}. Protein function prediction
+(PFP) is a setting where the assumption bites twice. As an \emph{evaluation} problem, PFP targets
+(GO terms, EC numbers) are hierarchically and definitionally dependent, so independent predictors
+can exploit label statistics rather than learn function. As an \emph{inference} problem, the
+symbolic structure that would repair the independence assumption---an ontology with tens of
+thousands of axioms---is far beyond the reach of exact probabilistic reasoning.
+
+We address both. We first ask whether leading PFP predictors generalize, controlling for the two
+ways a predictor can cheat: homology (sequence similarity to training) and curated features
+(shared annotated domains). Against the canonical CAFA baselines they do not---they memorize and
+collapse out-of-distribution (\S\ref{sec:memorize}). We then ask whether a differentiable WMC
+layer, compiling the target space's symbolic structure on top of \emph{any} base predictor,
+restores generalization, and we delimit exactly when it does (\S\ref{sec:method}--\ref{sec:results}).
+Finally we make the layer rigorous and scalable: we prove its approximation properties in Lean~4,
+give a modular construction that recovers exact WMC over almost all of GO, and compare against the
+full NeSy framework spectrum (\S\ref{sec:theory}).
+
+\paragraph{Contributions.}
+\begin{enumerate}\itemsep1pt
+\item \textbf{A controlled demonstration that PFP predictors memorize.} Under
+sequence-identity and InterPro-domain-novelty stratification, and against the CAFA Naive/BLAST
+baselines, we show CLEAN, DeepGOZero, DeepGOCNN and MLP collapse out-of-distribution; ProteInfer
+is the one exception, and we explain why (\S\ref{sec:memorize}, Table~\ref{tab:domain}).
+\item \textbf{A training-free WMC refinement layer with a sharp competence boundary.} The layer
+gives any base predictor zero-shot reach matching a \emph{trained} zero-shot model
+(Table~\ref{tab:zero}), and we prove---conceptually and empirically---that it helps the
+\emph{compositional} failure regime but not the \emph{perception} failure regime
+(\S\ref{sec:results}). This yields the governing principle: WMC helps iff the structure is
+external to supervision \emph{and} the base retains signal on the structure's components.
+\item \textbf{Machine-checked approximation guarantees.} We formalize the soft closure in Lean~4
+(no \texttt{sorry}; standard axioms) and prove it is exact on the tree fragment for \emph{all}
+priors, with error confined to reconvergences (\S\ref{sec:theory-lean}).
+\item \textbf{Modular exact WMC at ontology scale, and a full NeSy comparison.} We show $92$--$100\%$
+of GO is exactly computable after removing a ${<}8\%$ reconvergence core, and we run DeepProbLog,
+Scallop, A-NeSI and NeSyDM on the same task to place our method as the only one both scalable and
+accuracy-guaranteed (\S\ref{sec:scaling}).
+\end{enumerate}
+
+\section{Related work}\label{sec:related}
+\paragraph{Protein function prediction.}
+PFP is benchmarked by the CAFA challenges \citep{radivojac2013cafa,zhou2019cafa3}, which
+established protein-centric $\Fmax$ and the \emph{Naive} (label-frequency) and \emph{BLAST}
+(homology-transfer) baselines we use throughout. Modern predictors are sequence-based: protein
+language models \citep{rives2021esm1b,lin2023esm2} feed contrastive EC predictors such as CLEAN
+\citep{yu2023clean}; dilated CNNs predict GO/EC directly from sequence (ProteInfer
+\citep{sanderson2023proteinfer}, ProtCNN/ProtENN \citep{bileschi2022protenn}); and the DeepGO
+family combines sequence, InterPro and ontology structure
+\citep{kulmanov2018deepgo,kulmanov2020deepgoplus}, with DeepGOZero \citep{kulmanov2022deepgozero}
+adding zero-shot prediction through EL ontology axioms and ELEmbeddings
+\citep{kulmanov2019elembeddings}. Hierarchy-aware methods (TALE \citep{cao2021tale}) and
+multi-source ensembles (NetGO \citep{you2019netgo}) enforce the GO true-path rule, almost always
+by max-propagation---a deterministic upper envelope, not a coherent joint. Our critique is
+orthogonal to architecture: it is about \emph{what} is generalized, measured against the CAFA
+baselines.
+
+\paragraph{Neuro-symbolic learning and the independence assumption.}
+DeepProbLog \citep{manhaeve2018deepproblog} performs exact probabilistic inference by weighted
+model counting over a compiled circuit \citep{deraedt2007problog}; semantic loss
+\citep{xu2018semanticloss} and semantic probabilistic layers \citep{ahmed2022spl} condition
+neural outputs on Boolean knowledge via the same WMC machinery. Exact inference is
+treewidth-exponential, motivating approximations: Scallop \citep{huang2021scallop,li2023scallop}
+uses top-$k$ provenance; A-NeSI \citep{vankrieken2023anesi} amortizes inference into a learned
+surrogate; NeSyDM \citep{vankrieken2025nesydm} models the joint with discrete diffusion. The
+independence assumption underlying the first family is now understood to cause optimization and
+calibration failures and reasoning shortcuts
+\citep{vankrieken2024independence,marconato2023reasoningshortcuts,marconato2024bears}. We place all
+of these on a common GO task and show the exact methods do not scale and the approximate methods
+forfeit guarantees.
+
+\paragraph{Knowledge compilation and description-logic reasoning.}
+WMC is computed on tractable circuits---d-DNNF and SDD
+\citep{darwiche2002factoring,darwiche2011sdd,chavira2008wmc}---whose size is $O(n\,2^{w})$ in the
+treewidth $w$ \citep{darwiche2002kcmap,bodlaender1993treewidth}; belief propagation
+\citep{pearl1988probabilistic} is the message-passing limit, exact on trees. GO is an
+EL\textsuperscript{++} ontology \citep{baader2005elenvelope} whose consequences are computed by
+the ELK completion calculus \citep{kazakov2014elk}; richer logics use hypertableau
+\citep{motik2009hypertableau} or consequence-based context calculi
+\citep{bate2016sriq,tenacucala2019sequoia} over SROIQ \citep{horrocks2006sroiq}. Locality-based
+modules \citep{cuencagrau2008modular} and atomic decomposition \citep{delvescovo2011atomic}
+provide principled ontology decompositions. We formalize our guarantees in Lean~4
+\citep{demoura2021lean,mathlib2020}. For EC, metabolic producibility derives from network
+expansion / scope semantics \citep{ebenhoeh2004scope} and flux balance analysis
+\citep{orth2010fba} over genome-scale models reconstructed with gapseq-style tools
+\citep{zimmermann2021gapseq} on ModelSEED reactions \citep{henry2010modelseed}.
+
+\section{Problem setup and the WMC refinement layer}\label{sec:method}
+\paragraph{Independent perception.}
+Let $\mathcal{Y}=\{1,\dots,m\}$ be the target vocabulary. A perception model $f_\theta$ maps a
+protein $x$ to independent marginals $p_i=\sigma\!\big(f_\theta(x)_i\big)\in[0,1]$, inducing the
+fully factorized distribution
+$q(\bC y\mid x)=\prod_{i}p_i^{\,y_i}(1-p_i)^{1-y_i}$ over $\bC y\in\{0,1\}^m$. This is the
+independence assumption.
+
+\begin{definition}[Symbolic theory]
+A theory $T$ is a propositional formula over $\mathcal Y$ (the grounding of the domain's symbolic
+structure). For \textbf{GO}, $T=\bigwedge_{(c,\pi)\in E}(y_c\!\Rightarrow\!y_\pi)\,\wedge\,
+\bigwedge_{A\sqcap B\sqsubseteq E}(y_A\wedge y_B\!\Rightarrow\!y_E)\,\wedge\,(\text{existential
+defs})$, i.e.\ the true-path rule over is-a/part-of edges $E$ plus the GO-Plus logical
+definitions, taken from DeepGOZero's EL normal forms. For \textbf{EC}, $T$ encodes metabolic
+producibility (Def.~\ref{def:prod}).
+\end{definition}
+
+\begin{definition}[WMC refinement]
+The structure-conditioned posterior is $p_T(\bC y\mid x)\propto[\bC y\models T]\,q(\bC y\mid x)$,
+and the refined marginal of target $i$ is the ratio of weighted model counts
+\begin{equation}\label{eq:wmc}
+\mu_i \;=\; p_T(y_i{=}1\mid x)\;=\;\frac{\WMC(T\wedge y_i;\bC p)}{\WMC(T;\bC p)},\qquad
+\WMC(\phi;\bC p)=\!\!\sum_{\bC y\models\phi}\;\prod_i p_i^{\,y_i}(1-p_i)^{1-y_i}.
+\end{equation}
+\end{definition}
+Equation~\eqref{eq:wmc} is the semantic-probabilistic-layer construction
+\citep{ahmed2022spl,xu2018semanticloss}; our contribution is to (i)~apply it \emph{at inference},
+training-free, over the GO theory and (ii)~make it tractable and \emph{verified}.
+
+\paragraph{Zero-shot composition.}
+A term $E$ may be absent from supervision yet possess a logical definition in $T$ grounded in
+in-vocabulary terms. Its marginal is then obtained by evaluating the definition downward over the
+base marginals---a conjunction is a product, alternative sufficient conditions combine by the
+soft-OR over the proof structure---which is exactly the EL completion of \citet{kazakov2014elk}
+applied at inference. No training on $E$ is required.
+
+\begin{definition}[Producibility prior, EC]\label{def:prod}
+For an organism, let $M=(\mathcal{C},\mathcal{R},S)$ be a genome-scale model with metabolites
+$\mathcal C$, reactions $\mathcal R$, stoichiometry $S\in\R^{|\mathcal C|\times|\mathcal R|}$, and a
+growth medium $\mathcal M\subseteq\mathcal C$. A reaction set $R\subseteq\mathcal R$ \emph{produces}
+a target metabolite $t$ if $t$ lies in the least-fixpoint scope of $\mathcal M$ under $R$
+\citep{ebenhoeh2004scope} (equivalently, admits a feasible producing flux \citep{orth2010fba}).
+With reaction-presence variables $z_r$ weighted by the base predictor, $T_{\text{prod}}$ asserts
+that the chosen reactions render $t$ producible; the refined presence of a held-out reaction is
+its weighted frequency over producibility-satisfying sets. Operationally this is parsimonious
+gap-filling toward $t$.
+\end{definition}
+
+\paragraph{Soft closure.}
+Exact $\WMC(T;\bC p)$ is $\#$P-hard. We use the monotone message-passing fixpoint of the EL
+completion: each node aggregates a normalized soft-OR of its sufficient conditions and is capped
+by the true-path constraint from above. This is loopy belief propagation on the constraint graph;
+its exactness is characterized in \S\ref{sec:theory-lean}.
+
+\section{Learned function predictors memorize}\label{sec:memorize}
+\paragraph{CLEAN collapses with similarity to its training set.}
+On EC enzymes added to SwissProt \emph{after} CLEAN's publication---provably unseen---stratified
+by sequence identity to CLEAN's \texttt{split100} training set, exact-EC accuracy collapses
+monotonically $0.86\!\to\!0.07$ from high to low identity. The competence is similarity-driven.
+
+\paragraph{Against CAFA baselines, GO predictors memorize features.}
+Table~\ref{tab:domain} reports protein-centric $\Fmax$ on the DeepGOZero molecular-function test
+set, stratified by InterPro-domain overlap with training. BLAST collapses to $0.025$ on
+domain-novel proteins; the InterPro-feature models MLP and DeepGOZero fall to the Naive frequency
+floor ($0.37$)---their input \emph{is} the InterPro vector, which is uninformative for a novel
+domain. ProteInfer is the exception, holding $0.68$ on novel-domain and $0.52$ on no-InterPro
+proteins (the only method above the floor): consistent with its class-activation-map evidence
+\citep{sanderson2023proteinfer}, it learns \emph{sub-}InterPro motifs that transfer across domain
+boundaries, and indeed it degrades only on the no-domain subset and is known to fall below BLAST
+on the UniRef50 remote-homology split.
+
+\begin{table}[t]\centering
+\caption{$\Fmax$ by InterPro-domain novelty (molecular function; cellular-component and
+biological-process show the same shape). Feature-based models collapse to the Naive floor on
+novel domains; only ProteInfer generalizes.}\label{tab:domain}
+\small
+\begin{tabular}{lcccc}
+\toprule
+predictor & no-domain & all-novel & partial & all-seen\\
+\midrule
+Naive (frequency floor) & 0.306 & 0.368 & 0.363 & 0.305\\
+BLAST (homology) & 0.191 & \textbf{0.025} & 0.590 & 0.692\\
+MLP (InterPro input) & 0.309 & \textbf{0.369} & 0.659 & 0.694\\
+DeepGOZero (InterPro input) & 0.306 & \textbf{0.367} & 0.649 & 0.698\\
+ProteInfer (sequence CNN) & \textbf{0.523} & \textbf{0.679} & 0.696 & 0.702\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Results}\label{sec:results}
+\paragraph{Within-vocabulary GO: WMC is neutral.}
+Raw, max-propagation and the WMC closure differ by ${\le}0.007$ $\Fmax$ on all of cc/mf/bp $\times$
+\{MLP, DeepGOCNN, ProteInfer\} (e.g.\ mf/MLP raw $0.654$, WMC $0.653$). Within vocabulary the
+hierarchy is already in the supervised labels, so the structure adds nothing---neither helping
+nor meaningfully hurting.
+
+\paragraph{Zero-shot GO: training-free WMC matches a trained zero-shot extrapolator.}
+On every held-out GO term (no training annotations), we compare the training-free WMC definition
+closure against DeepGOZero's \emph{trained} ELEmbedding zero-shot predictor
+\citep{kulmanov2022deepgozero} (Table~\ref{tab:zero}). They are statistically indistinguishable on
+molecular function ($0.9125$ vs.\ $0.9118$, Wilcoxon $p=0.83$) and within $0.005$ elsewhere, while
+the base predictor, Naive and BLAST are all ${\approx}0.5$ on these terms. The WMC layer thus
+confers a \emph{trained-zero-shot-equivalent capability for free}, from ontology axioms alone.
+
+\begin{table}[t]\centering
+\caption{Zero-shot GO (held-out terms), macro per-term AUC: training-free WMC vs.\ trained
+DeepGOZero-zero. Base predictor, Naive and BLAST are ${\approx}0.5$ (no output, frequency or
+homolog).}\label{tab:zero}
+\small
+\begin{tabular}{lccc}
+\toprule
+namespace & $n$ terms & WMC (training-free) & DeepGOZero-zero (trained)\\
+\midrule
+molecular function & 194 & \textbf{0.9125} & 0.9118 \;($p{=}0.83$, tie)\\
+cellular component & 144 & 0.827 & 0.832 \;($p{=}0.005$)\\
+biological process & 1208 & 0.7973 & 0.7964 \;($p{=}2{\times}10^{-4}$)\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The competence boundary: compositional gap, not perception failure.}
+The WMC layer composes the base's \emph{own} per-target marginals. On a domain-novel protein the
+feature-based base has collapsed to the frequency floor on \emph{every} target---there is no
+component signal to compose---and the layer does not lift it (mf all-novel: DeepGOZero raw
+$0.367$, $+$WMC $0.365$; identical for MLP, and on bp). The layer helps when the base scores the
+\emph{parts} but not the \emph{target} (zero-shot terms), and not when perception itself has
+failed (domain-novel proteins). This is the cleanest statement of the governing principle.
+
+\paragraph{EC: producibility-WMC as a similarity-independent candidate layer.}
+As a refinement on CLEAN, organism-specific producibility-WMC (Def.~\ref{def:prod}) recovers
+held-out EC functions independently of sequence similarity, lifting CLEAN $0.491\!\to\!0.556$
+EC-level recovery (never worse per identity bucket; at ${\le}50\%$ identity $+8$ reactions, $0$
+losses, McNemar $p=0.008$). The honest scope is that this is a candidate-generation layer:
+producibility gap-filling is growth-coupled, so each recovery adds ${\sim}72$ reactions at $0.69$
+added-EC precision, and the radius is intrinsic---with growth disabled nothing is added, and it is
+not removable by media or objective tuning.
+
+\section{Theory, scalability, and comparison}\label{sec:theory}
+\subsection{The approximation is belief propagation: exact on trees, machine-checked}\label{sec:theory-lean}
+We formalize the soft closure in Lean~4 \citep{demoura2021lean}; the core development is in Lean
+core (no \texttt{sorry}; axioms $\subseteq\{\texttt{propext},\texttt{Quot.sound}\}$) and the
+general theorem uses mathlib \citep{mathlib2020}.
+
+\begin{theorem}[Tree-exactness, all priors]\label{thm:star}
+For a target $\pi$ with $k$ independent children $c_1,\dots,c_k$ under the true-path constraint
+$y_{c_j}\!\Rightarrow\!y_\pi$, the exact WMC marginal of $\pi$ equals the soft-OR update
+$\;\mu_\pi = q_\pi\big/\big(q_\pi+(1-q_\pi)\textstyle\prod_{j}(1-q_{c_j})\big)\;$
+for all $k$ and all priors $q_\pi,q_{c_j}$ (Lean: \texttt{star\_marginal\_eq\_softOR}).
+\end{theorem}
+Belief propagation \citep{pearl1988probabilistic} is exact on trees; Theorem~\ref{thm:star} is the
+machine-checked instance for the true-path theory. The error is localized at \emph{reconvergences}:
+on a diamond (two paths to a shared ancestor) the exact marginal is $5/6$ but the soft-OR gives
+$7/10$ (Lean: \texttt{diamond\_reconv\_inexact}); a breadth battery confirms exactness across an
+$81$-prior grid for trees and inexactness for the diamond. Convergence of the closure is
+unconditional; only its limit is structure-dependent.
+
+\subsection{Structure governs tractability; the reconvergent core is small}\label{sec:scaling}
+Exact WMC costs $\Theta(m\,2^{w})$ in the constraint-graph treewidth $w$
+\citep{darwiche2011sdd,bodlaender1993treewidth}. We measure $w=9$ (cc), $31$ (mf), $272$ (bp): on
+cc, exact junction-tree WMC runs in $7.5$\,s and the soft closure agrees to mean error
+$6\times10^{-4}$, $7\times$ larger at multi-parent nodes---precisely Theorem~\ref{thm:star}'s
+reconvergence error. Treewidth is a graph invariant, so bp admits no exact monolithic WMC; but
+cutting only the highest-degree reconvergence hubs makes the remainder exactly computable:
+removing $2.95\%$ of mf terms leaves $97\%$ exact, and $7.7\%$ of bp terms leaves $92\%$ exact.
+Hence $92$--$100\%$ of GO admits exact \emph{modular} WMC---compile each low-treewidth module to an
+SDD and pass weighted separator marginals---with the proven soft approximation confined and
+bounded to a small core. A principled module decomposition can be supplied by locality modules
+\citep{cuencagrau2008modular} or by the consequence-based context calculus
+\citep{bate2016sriq,tenacucala2019sequoia}.
+
+\begin{table}[t]\centering
+\caption{Neuro-symbolic inference on the same GO true-path WMC. DeepProbLog and Scallop both
+reproduce our exact marginals on validation cases (diamond $5/6$; chain $0.875$).}\label{tab:nesy}
+\small
+\begin{tabular}{lcc}
+\toprule
+method & scales to full GO? & accuracy at scale\\
+\midrule
+DeepProbLog \citep{manhaeve2018deepproblog} (exact KC) & no (wall ${\sim}400$ terms) & exact when it runs\\
+Scallop \citep{huang2021scallop} (top-$k$) & yes (${<}1$\,s) & no guarantee; drift at reconvergence\\
+A-NeSI \citep{vankrieken2023anesi} / NeSyDM \citep{vankrieken2025nesydm} & learned & collapse on coupled structure ($N{=}4$)\\
+\textbf{ours} (soft-WMC $+$ modular) & yes & exact on tree (Lean) $+$ modular-exact $92$--$100\%$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Comparison to NeSy frameworks}
+Running the canonical tools on the identical task (Table~\ref{tab:nesy}): the ProbLog engine of
+DeepProbLog reproduces our exact marginals but, via knowledge compilation, walls at ${\sim}400$
+terms (TIMEOUT $>300$\,s)---one to two orders below GO's $2.8$k--$21$k terms. Scallop's top-$k$
+provenance scales to full bp ($21{,}324$ terms in $0.9$\,s) but undercounts proofs exactly at
+reconvergences: for the diamond, $P(\text{holds}(a))$ exact $0.9375$ is approximated as
+$0.50$ ($k{=}1$), $0.875$ ($k{=}3$), $0.9375$ ($k{=}10$)---and at GO scale (bp circuit rank
+$24{,}432$) this drift is unverifiable, no exact reference being computable. Learned approximators
+do not escape the wall but relocate it to coupled structure: on the carry-chain benchmark, A-NeSI
+collapses $0.97\!\to\!0.23$ and NeSyDM $0.96\!\to\!0.03$ from $N{=}1$ to $N{=}4$. Only our method
+is simultaneously scalable and accuracy-characterized.
+
+\section{Discussion}
+The contribution is a set of bounds, and the bounds are the result. Learned PFP predictors
+memorize homology and curated features and collapse off-distribution; a machine-checked WMC layer
+gives any base predictor training-free, similarity-independent reach over the \emph{compositional}
+structure it was never supervised on---matching a trained zero-shot extrapolator---and is provably
+exact on the tree fragment and modular-exact over almost all of GO. It does not repair perception
+failure (domain-novel proteins), and on metabolism it is a candidate-generation layer at a stated
+precision. Across the NeSy spectrum---exact compilation, top-$k$ provenance, amortized inference,
+joint diffusion---it is the only option that is at once scalable and accuracy-guaranteed. Two
+extensions follow naturally: lifting the consequence-based context calculus
+\citep{bate2016sriq,tenacucala2019sequoia} from Boolean consequences to weighted separator
+messages for verified modular WMC, and extending the EL\textsuperscript{++} compilation toward
+SROIQ \citep{horrocks2006sroiq,motik2009hypertableau}.
+
+\paragraph{Data and code availability.}
+All experiments, scripts and the Lean developments are released at
+\url{https://github.com/bio-ontology-research-group/nesy-pfp}; the EL\textsuperscript{++} reasoner
+core and proofs are in the accompanying \texttt{moose} repository.
+
+{\small\bibliographystyle{unsrtnat}\bibliography{references}}
+\end{document}
